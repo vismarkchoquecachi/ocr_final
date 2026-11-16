@@ -1,0 +1,12 @@
+# credenciales y configuracion local, nunca se suben
+.env
+
+# documentos de clientes y resultados
+pdfs/
+salida/
+
+# archivos temporales de python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
