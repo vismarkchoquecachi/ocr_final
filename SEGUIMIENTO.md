@@ -16,7 +16,7 @@ Repositorio: https://github.com/vismarkchoquecachi/ocr_final (privado, rama `mai
 | Importar lo ya procesado sin llamar a la IA (`importar.py`) | Listo |
 | Código reescrito en estilo simple | Listo |
 | Índice por huella del PDF (`indice.json`) | Listo |
-| Cambios subidos a GitHub | Pendiente, solo está subido el primer commit |
+| Cambios subidos a GitHub | Listo, commit `2520ef4` |
 | Prueba real con un PDF nuevo enviado a la IA | Pendiente |
 
 ## Cambios realizados
@@ -64,7 +64,7 @@ Resultado de la prueba:
 
 ## Pendientes
 
-- [ ] **Subir a GitHub los cambios del 2026-11-17.** Archivos modificados: `.env.example`, `README.md`, `archivo_csv.py`, `config.py`, `ia.py`, `main.py`, `procesamiento.py`, `prompt.py`, `sql.py`. Archivos nuevos: `importar.py`, `indice.py`, `SEGUIMIENTO.md`.
+- [x] **Subir a GitHub los cambios del 2026-11-17.** Commit `2520ef4`.
 - [ ] **Borrar las 3 filas de error en SQL Server** antes de reprocesar. Son las páginas 7, 10 y 12 de `CASOS DE TRANSFERENCIAS.pdf`. El índice las marca como `error` y las va a reenviar, pero el INSERT fallará mientras esas filas sigan en la tabla:
 
   ```sql
