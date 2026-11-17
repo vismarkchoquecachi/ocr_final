@@ -92,6 +92,7 @@ Se elige con `destino` en `.env`, con `--destino` al ejecutar o en la ventana:
 - Las páginas que fallan no se insertan; quedan en `resultados.jsonl` y en el CSV, y se reintentan en la siguiente ejecución. Antes de la primera ejecución, ejecute una vez `crear_tabla.sql` en SQL Server (por ejemplo en SQL Server Management Studio); crea la base `FacturasOCR` y la tabla `dbo.SeguimientoOCR` si no existen. Si cambia `sql_base_datos` en `.env`, cambie también el nombre de la base en ese archivo.
 - El programa no comprueba que la tabla exista: da por hecho que ya fue creada. Si falta, se detiene con el error de SQL Server antes de llamar a la IA.
 - Con `sql_usuario` vacío usa la autenticación de Windows.
+- Para pasar a SQL Server páginas ya procesadas sin volver a llamar a la IA (por ejemplo, después de crear la tabla en otro servidor), use `python importar.py`. Lee el historial (`resultados.jsonl`) de la carpeta de salida e inserta solo las páginas que no están en la tabla. Con `--prueba` muestra qué insertaría sin insertar nada, y con `--historial RUTA` lee otro archivo.
 - Si la contraseña tiene espacios o `#`, escríbala entre comillas: `sql_clave="mi clave#1"`.
 
 ### Reglas de guardado
@@ -123,6 +124,7 @@ Todo lo que se puede cambiar está en `.env`: credenciales, carpetas, nombres de
 | `archivo_resultados` | Nombre del historial | `resultados.jsonl` |
 | `archivo_excluidos` | Nombre del registro de páginas excluidas | `excluidos.jsonl` |
 | `archivo_errores` | Nombre del registro de errores | `errores.jsonl` |
+| `archivo_indice` | Nombre del índice de páginas ya procesadas | `indice.json` |
 | `imagen_dpi` | Calidad de la imagen, entre 72 y 450 | `300` |
 | `ia_concurrencia` | Páginas enviadas a la vez, entre 1 y 16 | `4` |
 | `ia_tiempo_espera` | Segundos de espera por respuesta, entre 10 y 600 | `120` |
@@ -139,7 +141,7 @@ No se extraen ni se guardan datos de:
 - Formularios **ORDEN DE TRANSFERENCIAS AL EXTERIOR (OTE)**, estén solos o dentro de una página.
 - Páginas en blanco o que solo tienen texto narrativo, sin un documento de pago.
 
-Si la página tiene además una proforma, factura o comprobante, se extraen solo los datos de ese documento. Las páginas excluidas quedan anotadas en `excluidos.jsonl` (archivo, página y motivo) para no volver a cobrarlas. Para revisar de nuevo una, borre su línea.
+Si la página tiene además una proforma, factura o comprobante, se extraen solo los datos de ese documento. Las páginas excluidas quedan anotadas en `excluidos.jsonl` (archivo, página y motivo) y en `indice.json`, para no volver a cobrarlas. Para revisar de nuevo una, borre su número de página en `indice.json`.
 
 ## Resultados
 
@@ -149,10 +151,22 @@ Si la página tiene además una proforma, factura o comprobante, se extraen solo
 | SQL `dbo.SeguimientoOCR` | Los mismos datos, más la respuesta original de la IA |
 | `salida\resultados.jsonl` | Historial completo con la respuesta original de la IA |
 | `salida\excluidos.jsonl` | Páginas excluidas y su motivo |
+| `salida\indice.json` | Qué páginas ya se procesaron, por huella del PDF |
 | `salida\errores.jsonl` | PDF que no se pudieron abrir y fallos al guardar |
 | `salida\<pdf>_<fecha>_<id>\` | PNG y JSON de cada página procesada |
 
-Las páginas ya procesadas de un PDF que no cambió no se vuelven a enviar a la IA.
+## Cómo decide si una página se envía a la IA
+
+Cada PDF se identifica por su huella (hash SHA-256 de su contenido completo), no por su nombre ni por su ruta. `indice.json` guarda, por cada huella, el estado de cada página: `ok`, `revisar`, `excluida` o `error`.
+
+- `ok`, `revisar` o `excluida`: la página no se vuelve a enviar.
+- `error` o sin estado: la página se envía.
+- Si mueve, copia o renombra un PDF, la huella es la misma y no se vuelve a cobrar.
+- Si cambia el contenido del PDF, la huella es otra y sus páginas se procesan de nuevo.
+- Para reprocesar una página a propósito, borre su número en `indice.json`. Para reprocesar un PDF completo, borre su bloque.
+- Con `omitir_existentes=false` se reenvían también las `ok` y `revisar`; las excluidas no.
+- Si `indice.json` no existe, se arma solo a partir de `resultados.jsonl` y `excluidos.jsonl`.
+- Una página que no está en el índice pero ya está en SQL Server con la misma ruta no se envía, porque como el programa solo inserta no se podría guardar. Si el PDF cambió, borre sus filas en SQL Server para procesarlo de nuevo.
 
 ## Archivos
 
@@ -162,9 +176,11 @@ Las páginas ya procesadas de un PDF que no cambió no se vuelven a enviar a la 
 | `.env` | Credenciales, rutas, nombres de archivos, parámetros y el prompt |
 | `prompt.py` | Arma el prompt con las secciones de `.env` |
 | `ia.py` | Conexión con los proveedores de IA |
+| `indice.py` | Índice de páginas ya procesadas, por huella del PDF |
 | `procesamiento.py` | PDF a imagen, validación y exclusiones |
 | `archivo_csv.py` | Guardado en CSV |
 | `sql.py` | Guardado en SQL Server (solo consulta e inserta) |
+| `importar.py` | Pasa a SQL Server lo ya procesado, sin llamar a la IA |
 | `crear_tabla.sql` | Crea la base y la tabla; se ejecuta una sola vez en SQL Server |
 | `config.py` | Lectura de `.env` |
 | `requirements.txt` | Paquetes de Python que se instalan una sola vez |
