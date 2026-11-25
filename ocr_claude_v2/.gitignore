@@ -1,0 +1,13 @@
+# credenciales y configuracion local, nunca se suben
+.env
+
+# documentos de clientes y resultados, la carpeta pdfs queda vacia
+pdfs/*
+!pdfs/.gitkeep
+salida/
+
+# archivos temporales de python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
