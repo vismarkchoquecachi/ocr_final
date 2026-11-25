@@ -155,7 +155,7 @@ Si la página tiene además una proforma, factura o comprobante, se extraen solo
 
 | Archivo | Contenido |
 |---|---|
-| CSV (`csv_ruta` o `salida\resultados.csv`) | Tabla para Excel, una fila por página |
+| CSV (`csv_ruta` o `salida\resultados.csv`) | Tabla para Excel, una fila por página, con la columna `RutaImagen` (ruta completa del PNG que se envió a la IA) |
 | SQL `dbo.SeguimientoOCR` | Los mismos datos, más la respuesta original de la IA |
 | `salida\resultados.jsonl` | Historial completo con la respuesta original de la IA |
 | `salida\excluidos.jsonl` | Páginas excluidas y su motivo |
