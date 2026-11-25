@@ -13,7 +13,7 @@ BASE = Path(__file__).resolve().parent
 # por cada proveedor, variable de su clave, modelo que se usa si no se indica otro y url base
 PROVEEDORES = {
     "openai": ("openai_clave", "gpt-6-astra", "https://api.openai.com/v1"),
-    "anthropic": ("anthropic_clave", "claude-sonnet-5-5", "https://api.anthropic.com/v1"),
+    "anthropic": ("anthropic_clave", "claude-haiku-5-5", "https://api.anthropic.com/v1"),
     "gemini": ("gemini_clave", "gemini-3-flash-preview", "https://generativelanguage.googleapis.com/v1beta"),
     "compatible": ("ia_clave", "", ""),
 }
@@ -51,12 +51,17 @@ class Configuracion:
         reintentos=5,
         instrucciones="",
         solicitud="",
+        esfuerzo="",
+        recorte=None,
+        carpeta_imagenes="imagenes",
+        carpeta_respuestas="respuestas_ia",
     ):
         # credenciales y modelo de la ia
         self.proveedor = proveedor
         self.modelo = modelo
         self.api_key = api_key
         self.url_base = url_base
+        self.esfuerzo = esfuerzo
 
         # donde se guarda
         self.destino = destino
@@ -74,6 +79,7 @@ class Configuracion:
 
         # parametros
         self.dpi = dpi
+        self.recorte = recorte
         self.concurrencia = concurrencia
         self.omitir_existentes = omitir_existentes
         self.tiempo_espera = tiempo_espera
@@ -85,6 +91,10 @@ class Configuracion:
         self.archivo_excluidos = archivo_excluidos
         self.archivo_errores = archivo_errores
         self.archivo_indice = archivo_indice
+
+        # carpetas dentro de la carpeta de salida
+        self.carpeta_imagenes = carpeta_imagenes
+        self.carpeta_respuestas = carpeta_respuestas
 
         # prompt
         self.instrucciones = instrucciones
@@ -155,6 +165,16 @@ def leer_nombre_archivo(nombre, predeterminado):
 
     if tiene_carpeta or extension_distinta:
         raise ValueError(f"{nombre} debe ser un nombre de archivo {extension}, sin carpetas.")
+
+    return texto
+
+
+def leer_nombre_carpeta(nombre, predeterminado):
+    # lee el nombre de una carpeta que va dentro de la carpeta de salida, sin rutas
+    texto = leer_texto(nombre, predeterminado)
+
+    if Path(texto).name != texto or texto in (".", ".."):
+        raise ValueError(f"{nombre} debe ser solo el nombre de una carpeta, sin rutas.")
 
     return texto
 
@@ -285,7 +305,10 @@ def cargar():
         sql_clave=sql_clave,
         entrada=leer_ruta("carpeta_pdf", "pdfs"),
         salida=leer_ruta("carpeta_salida", "salida"),
-        dpi=leer_entero("imagen_dpi", 300, 72, 450),
+        dpi=leer_entero("imagen_dpi", 200, 72, 450),
+        recorte=leer_recorte(),
+        carpeta_imagenes=leer_nombre_carpeta("carpeta_imagenes", "imagenes"),
+        carpeta_respuestas=leer_nombre_carpeta("carpeta_respuestas", "respuestas_ia"),
         concurrencia=leer_entero("ia_concurrencia", 4, 1, 16),
         omitir_existentes=leer_booleano("omitir_existentes", True),
         archivo_csv=archivo_csv,
@@ -297,13 +320,27 @@ def cargar():
         reintentos=leer_entero("ia_reintentos", 5, 0, 10),
         instrucciones=instrucciones,
         solicitud=solicitud,
+        esfuerzo=leer_texto("ia_esfuerzo").lower(),
     )
+
+
+def leer_recorte():
+    # ajustes del recorte de margenes, devuelve none si recorte_activo es false
+    if not leer_booleano("recorte_activo", True):
+        return None
+
+    return {
+        "dpi_deteccion": leer_entero("recorte_dpi_deteccion", 50, 20, 150),
+        "diferencia": leer_entero("recorte_diferencia", 40, 5, 200),
+        "minimo_pixeles": leer_entero("recorte_minimo_pixeles", 2, 1, 50),
+        "margen_porcentaje": leer_entero("recorte_margen_porcentaje", 2, 0, 20),
+    }
 
 
 def validar(configuracion):
     # revisa que no falte nada antes de empezar a procesar
     if configuracion.proveedor == "":
-        raise ValueError("Falta la credencial de IA. Complete en .env una clave, por ejemplo gemini_clave.")
+        raise ValueError("Falta la credencial de IA. Complete en .env la clave, por ejemplo anthropic_clave.")
 
     if configuracion.modelo == "":
         raise ValueError("Falta ia_modelo en .env.")

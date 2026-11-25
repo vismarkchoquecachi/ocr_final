@@ -38,9 +38,6 @@ class IndicePaginas:
 
         return documento["paginas"].get(str(pagina))
 
-    def esta_terminada(self, huella, pagina):
-        return self.estado(huella, pagina) in ESTADOS_TERMINADOS
-
     def marcar(self, huella, pagina, estado, ruta_pdf, guardar=True):
         # anota el estado de una pagina, un error nunca reemplaza un resultado bueno anterior
         documento = self.documentos.get(huella)
