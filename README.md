@@ -23,11 +23,14 @@ Una sola vez, instale las dependencias:
 python -m pip install -r requirements.txt
 ```
 
+Está configurado para Claude Haiku 5.5 (`ia_proveedor=anthropic`, `ia_modelo=claude-haiku-5-5`, `ia_esfuerzo=low`). Lo único que hay que completar en `.env` es `anthropic_clave`, con una clave de console.anthropic.com.
+
 Después:
 
 1. Copie los PDF en la carpeta `pdfs`.
-2. Ejecute `python main.py`.
-3. Abra el CSV en Excel o consulte la tabla en SQL Server.
+2. Ejecute `python main.py`: crea las imágenes en `salida\imagenes`, las envía a Claude y deja una respuesta por imagen en `salida\respuestas_ia` y el CSV.
+3. Ejecute `python cargar_sql.py`: pasa las respuestas a SQL Server.
+4. Abra el CSV en Excel o consulte la tabla en SQL Server.
 
 La primera vez, si no existe `.env`, el programa lo crea a partir de `.env.example` y avisa para que complete las credenciales.
 
@@ -41,6 +44,8 @@ La primera vez, si no existe `.env`, el programa lo crea a partir de `.env.examp
 | `python main.py --csv "D:\reportes\transferencias.csv"` | Elige en qué archivo CSV se guarda |
 | `python main.py --entrada CARPETA --salida CARPETA` | Cambia las carpetas de PDF y de resultados |
 | `python prompt.py` | Muestra el prompt completo que recibe la IA |
+| `python cargar_sql.py` | Pasa a SQL Server las respuestas de `salida\respuestas_ia` |
+| `python cargar_sql.py --prueba` | Muestra qué insertaría en SQL Server, sin insertar nada |
 
 El programa devuelve 0 si todo salió bien y 1 si hubo errores, para usarlo en tareas programadas.
 
@@ -92,8 +97,7 @@ Se elige con `destino` en `.env`, con `--destino` al ejecutar o en la ventana:
 - Las páginas que fallan no se insertan; quedan en `resultados.jsonl` y en el CSV, y se reintentan en la siguiente ejecución. Antes de la primera ejecución, ejecute una vez `crear_tabla.sql` en SQL Server (por ejemplo en SQL Server Management Studio); crea la base `FacturasOCR` y la tabla `dbo.SeguimientoOCR` si no existen. Si cambia `sql_base_datos` en `.env`, cambie también el nombre de la base en ese archivo.
 - El programa no comprueba que la tabla exista: da por hecho que ya fue creada. Si falta, se detiene con el error de SQL Server antes de llamar a la IA.
 - Con `sql_usuario` vacío usa la autenticación de Windows.
-- Para pasar a SQL Server páginas ya procesadas sin volver a llamar a la IA (por ejemplo, después de crear la tabla en otro servidor), use `python importar.py`. Lee el historial (`resultados.jsonl`) de la carpeta de salida e inserta solo las páginas que no están en la tabla. Con `--prueba` muestra qué insertaría sin insertar nada, y con `--historial RUTA` lee otro archivo.
-- Si la contraseña tiene espacios o `#`, escríbala entre comillas: `sql_clave="mi clave#1"`.
+- Para pasar a SQL Server las respuestas de la IA de la carpeta `respuestas_ia`, use `python cargar_sql.py`. Lee un JSON por página, valida los campos e inserta solo las páginas que no están en la tabla. Las páginas excluidas y las que tuvieron error de la IA no se cargan. Con `--prueba` muestra qué insertaría sin insertar nada, y con `--carpeta RUTA` lee otra carpeta.- Si la contraseña tiene espacios o `#`, escríbala entre comillas: `sql_clave="mi clave#1"`.
 
 ### Reglas de guardado
 
@@ -125,7 +129,11 @@ Todo lo que se puede cambiar está en `.env`: credenciales, carpetas, nombres de
 | `archivo_excluidos` | Nombre del registro de páginas excluidas | `excluidos.jsonl` |
 | `archivo_errores` | Nombre del registro de errores | `errores.jsonl` |
 | `archivo_indice` | Nombre del índice de páginas ya procesadas | `indice.json` |
-| `imagen_dpi` | Calidad de la imagen, entre 72 y 450 | `300` |
+| `imagen_dpi` | Calidad de la imagen, entre 72 y 450 | `200` |
+| `recorte_activo` | `true` recorta los márgenes en blanco antes de enviar la imagen | `true` |
+| `recorte_diferencia`, `recorte_minimo_pixeles`, `recorte_margen_porcentaje`, `recorte_dpi_deteccion` | Sensibilidad del recorte y margen de seguridad | `40`, `2`, `2`, `50` |
+| `carpeta_imagenes` | Carpeta, dentro de la salida, con las imágenes listas para la IA | `imagenes` |
+| `carpeta_respuestas` | Carpeta, dentro de la salida, con un JSON de respuesta por imagen | `respuestas_ia` |
 | `ia_concurrencia` | Páginas enviadas a la vez, entre 1 y 16 | `4` |
 | `ia_tiempo_espera` | Segundos de espera por respuesta, entre 10 y 600 | `120` |
 | `ia_reintentos` | Reintentos si la IA falla, entre 0 y 10 | `5` |
@@ -153,7 +161,10 @@ Si la página tiene además una proforma, factura o comprobante, se extraen solo
 | `salida\excluidos.jsonl` | Páginas excluidas y su motivo |
 | `salida\indice.json` | Qué páginas ya se procesaron, por huella del PDF |
 | `salida\errores.jsonl` | PDF que no se pudieron abrir y fallos al guardar |
-| `salida\<pdf>_<fecha>_<id>\` | PNG y JSON de cada página procesada |
+| `salida\imagenes\` | PNG recortado de cada página enviada a la IA, `<pdf>_pagina_<n>.png` |
+| `salida\respuestas_ia\` | Un JSON por imagen, `<pdf>_pagina_<n>.json`, con la respuesta de la IA y sus métricas (tokens, segundos, tamaño de la imagen) |
+
+Cada JSON de `respuestas_ia` tiene `estado` (`extraida`, `excluida` o `error`), `respuesta` (las ocho claves que pide el esquema), `error` y `metricas`. Si dos PDF de distintas carpetas se llaman igual, a sus archivos se les agrega una marca de 8 caracteres para que no se pisen.
 
 ## Cómo decide si una página se envía a la IA
 
@@ -180,8 +191,7 @@ Cada PDF se identifica por su huella (hash SHA-256 de su contenido completo), no
 | `procesamiento.py` | PDF a imagen, validación y exclusiones |
 | `archivo_csv.py` | Guardado en CSV |
 | `sql.py` | Guardado en SQL Server (solo consulta e inserta) |
-| `importar.py` | Pasa a SQL Server lo ya procesado, sin llamar a la IA |
-| `crear_tabla.sql` | Crea la base y la tabla; se ejecuta una sola vez en SQL Server |
+| `cargar_sql.py` | Pasa a SQL Server las respuestas de `respuestas_ia`, sin llamar a la IA || `crear_tabla.sql` | Crea la base y la tabla; se ejecuta una sola vez en SQL Server |
 | `config.py` | Lectura de `.env` |
 | `requirements.txt` | Paquetes de Python que se instalan una sola vez |
 

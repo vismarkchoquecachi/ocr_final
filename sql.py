@@ -2,6 +2,7 @@
 # este archivo solo consulta e inserta, nunca modifica ni borra filas
 # la tabla se crea una vez con crear_tabla.sql
 import json
+from datetime import datetime
 
 
 # drivers odbc que se buscan, en este orden
@@ -22,6 +23,7 @@ INSERT INTO dbo.SeguimientoOCR
 (
     ArchivoOrigen,
     NumPagina,
+    FechaCarga,
     NombreOrdenante,
     FechaTransferencia,
     INVOICE,
@@ -32,7 +34,7 @@ INSERT INTO dbo.SeguimientoOCR
     MotivoRevision,
     JsonCrudo
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 # numero de error de sql server cuando la fila ya existe
@@ -140,9 +142,13 @@ class RepositorioSql:
 
         json_crudo = json.dumps(registro.JsonCrudo, ensure_ascii=False, default=str)
 
+        # fecha y hora de esta maquina, sin microsegundos
+        fecha_carga = datetime.now().replace(microsecond=0)
+
         valores = (
             registro.ArchivoOrigen,
             registro.NumPagina,
+            fecha_carga,
             registro.NombreOrdenante,
             registro.FechaTransferencia,
             registro.INVOICE,

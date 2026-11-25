@@ -3,6 +3,7 @@
 import base64
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -25,8 +26,15 @@ CAMPOS = (
     "MotivoRevision",
 )
 
-# nombre de la herramienta que se le pide usar a anthropic
-HERRAMIENTA = "registrar_comprobante"
+# limite de tokens de la respuesta de anthropic, incluye el razonamiento del modelo
+# solo se paga lo que realmente se usa, un limite bajo puede cortar la respuesta
+MAXIMO_TOKENS_ANTHROPIC = 16000
+
+# modelos de anthropic que aceptan un modelo de respaldo si el primero rechaza la pagina
+MODELOS_CON_RESPALDO = ("claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-fable-5-1")
+
+# niveles de esfuerzo que acepta anthropic, mas esfuerzo es mas razonamiento y mas costo
+ESFUERZOS = ("low", "medium", "high", "xhigh", "max")
 
 # peso maximo de la imagen en bytes, anthropic acepta menos que los demas
 LIMITE_IMAGEN_ANTHROPIC = 3_700_000
@@ -150,9 +158,15 @@ class ExtractorIA:
         reintentos=5,
         instrucciones="",
         solicitud="",
+        esfuerzo="",
     ):
         if proveedor not in ("openai", "anthropic", "gemini", "compatible"):
             raise ValueError(f"Proveedor no soportado: {proveedor}")
+
+        if esfuerzo != "" and esfuerzo not in ESFUERZOS:
+            raise ValueError(f"ia_esfuerzo debe ser uno de: {', '.join(ESFUERZOS)}, o quedar vacío.")
+
+        self.esfuerzo = esfuerzo
 
         if instrucciones.strip() == "" or solicitud.strip() == "":
             raise ValueError("Falta el prompt. Revise las variables prompt_ en .env.")
@@ -165,6 +179,11 @@ class ExtractorIA:
         self.reintentos = reintentos
         self.instrucciones = instrucciones
         self.solicitud = solicitud
+
+        # tokens del prompt sin la imagen, se cuentan una sola vez por ejecucion
+        self.candado = threading.Lock()
+        self.prompt_contado = False
+        self.tokens_prompt = None
 
     @property
     def nombre(self):
@@ -240,14 +259,9 @@ class ExtractorIA:
             raise
 
     def llamar_anthropic(self, imagen64, tipo):
-        # formato de anthropic, se obliga a la ia a usar una herramienta con el esquema
+        # formato de anthropic, la respuesta se pide en json con el esquema
+        # no se usa una herramienta obligatoria porque los modelos actuales la rechazan con error 400
         encabezados = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}
-
-        herramienta = {
-            "name": HERRAMIENTA,
-            "description": "Registra los datos extraídos del comprobante.",
-            "input_schema": ESQUEMA,
-        }
 
         mensaje_usuario = {
             "role": "user",
@@ -257,17 +271,66 @@ class ExtractorIA:
             ],
         }
 
+        # formato de la respuesta y esfuerzo, si el esfuerzo queda vacio se usa el del modelo
+        opciones_salida = {"format": {"type": "json_schema", "schema": ESQUEMA}}
+        if self.esfuerzo != "":
+            opciones_salida["effort"] = self.esfuerzo
+
         cuerpo = {
             "model": self.modelo,
-            "max_tokens": 2048,
+            "max_tokens": MAXIMO_TOKENS_ANTHROPIC,
             "system": self.instrucciones,
-            "tools": [herramienta],
-            "tool_choice": {"type": "tool", "name": HERRAMIENTA},
             "messages": [mensaje_usuario],
+            "output_config": opciones_salida,
         }
+
+        # si el modelo rechaza la pagina por seguridad, la api la reintenta sola con un modelo de respaldo
+        if self.modelo in MODELOS_CON_RESPALDO:
+            encabezados["anthropic-beta"] = "server-side-fallback-2026-07-01"
+            cuerpo["fallbacks"] = "default"
 
         url = f"{self.url_base}/messages"
         return self.enviar(url, encabezados, cuerpo)
+
+    def contar_tokens_prompt(self):
+        # tokens del prompt sin la imagen, anthropic devuelve prompt e imagen sumados en input_tokens
+        # se cuentan una vez con el endpoint de conteo, que no se cobra, y la diferencia es la imagen
+        # devuelve none si no es anthropic o si no se pudo contar
+        if self.proveedor != "anthropic":
+            return None
+
+        with self.candado:
+            if self.prompt_contado:
+                return self.tokens_prompt
+            self.prompt_contado = True
+
+            encabezados = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}
+            cuerpo = {
+                "model": self.modelo,
+                "system": self.instrucciones,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": self.solicitud}]}],
+                "output_config": {"format": {"type": "json_schema", "schema": ESQUEMA}},
+            }
+            url = f"{self.url_base}/messages/count_tokens"
+
+            try:
+                crudo = self.enviar(url, encabezados, cuerpo)
+            except ErrorIA as error:
+                # si el conteo no acepta el esquema se cuenta sin el
+                if error.codigo != 400:
+                    return None
+                cuerpo.pop("output_config")
+                try:
+                    crudo = self.enviar(url, encabezados, cuerpo)
+                except ErrorIA:
+                    return None
+
+            try:
+                self.tokens_prompt = int(json.loads(crudo)["input_tokens"])
+            except (ValueError, KeyError, TypeError):
+                self.tokens_prompt = None
+
+            return self.tokens_prompt
 
     def llamar_gemini(self, imagen64, tipo):
         # formato de gemini, la respuesta se pide en json con el esquema
@@ -297,12 +360,28 @@ class ExtractorIA:
         # cada proveedor devuelve los datos en un lugar distinto
 
         if self.proveedor == "anthropic":
-            for bloque in respuesta.get("content", []):
-                if bloque.get("type") == "tool_use":
-                    return bloque["input"]
-
             motivo = respuesta.get("stop_reason")
-            raise ErrorIA(f"{self.nombre} no devolvió datos estructurados (stop_reason={motivo})")
+
+            # el modelo, y el de respaldo si lo hubo, rechazaron la pagina
+            if motivo == "refusal":
+                detalle = respuesta.get("stop_details") or {}
+                categoria = detalle.get("category") or "sin categoría"
+                raise ErrorIA(f"{self.nombre} rechazó la página (categoría: {categoria})")
+
+            # la respuesta se corto antes de terminar el json
+            if motivo == "max_tokens":
+                raise ErrorIA(f"{self.nombre} cortó la respuesta por el límite de {MAXIMO_TOKENS_ANTHROPIC} tokens")
+
+            # se juntan los bloques de texto, los de razonamiento se ignoran
+            texto = ""
+            for bloque in respuesta.get("content", []):
+                if bloque.get("type") == "text":
+                    texto = texto + bloque.get("text", "")
+
+            if texto == "":
+                raise ErrorIA(f"{self.nombre} no devolvió datos (stop_reason={motivo})")
+
+            return extraer_json(texto)
 
         if self.proveedor == "gemini":
             candidatos = respuesta.get("candidates") or []

@@ -2,9 +2,12 @@
 import hashlib
 import json
 import math
+import os
 import re
 import threading
+import time
 import unicodedata
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -42,7 +45,8 @@ VALORES_NULOS = (
 # titulos de documentos que no deben aparecer como valor de un campo
 TITULO_DOCUMENTO = re.compile(
     r"^(orden(es)?|comprobante|constancia|solicitud|formulario|datos)\b.*\b(transferencia|ordenante|beneficiario|operaci[oó]n)"
-    r"|^(ote|swift|mt\s?103)$|\(ote\)",
+    r"|^(ote|swift|mt\s?103)$|\(ote\)"
+    r"|^(proforma|commercial|factura)?\s*(invoice|factura|proforma)$",
     re.IGNORECASE,
 )
 
@@ -401,6 +405,168 @@ def dpi_seguro(ancho, alto, dpi):
     return ajustado
 
 
+def detectar_contenido(pagina, ajustes):
+    # devuelve el rectangulo de la pagina que tiene algo escrito, o none si no se pudo decidir
+    pixmap = pagina.get_pixmap(dpi=ajustes["dpi_deteccion"], colorspace=pymupdf.csGRAY, alpha=False)
+    ancho = pixmap.width
+    alto = pixmap.height
+    salto = pixmap.stride
+    muestras = pixmap.samples
+
+    # el fondo es el gris mas comun de la pagina, asi sirve para papel blanco o grisaceo
+    fondo = Counter(muestras[::5]).most_common(1)[0][0]
+
+    # un pixel es contenido si se aleja del fondo mas que la diferencia
+    diferencia = ajustes["diferencia"]
+    tabla = bytes(1 if abs(valor - fondo) > diferencia else 0 for valor in range(256))
+    binario = muestras.translate(tabla)
+
+    # filas y columnas con suficientes pixeles de contenido, asi una mota suelta no cuenta
+    minimo = ajustes["minimo_pixeles"]
+
+    filas = []
+    for fila in range(alto):
+        inicio = fila * salto
+        if binario[inicio:inicio + ancho].count(1) >= minimo:
+            filas.append(fila)
+
+    columnas = []
+    for columna in range(ancho):
+        if binario[columna::salto].count(1) >= minimo:
+            columnas.append(columna)
+
+    if len(filas) == 0 or len(columnas) == 0:
+        return None
+
+    # pasa de pixeles a puntos de la pagina, un punto es 1/72 de pulgada
+    rectangulo = pagina.rect
+    escala_x = rectangulo.width / ancho
+    escala_y = rectangulo.height / alto
+
+    x0 = rectangulo.x0 + columnas[0] * escala_x
+    x1 = rectangulo.x0 + (columnas[-1] + 1) * escala_x
+    y0 = rectangulo.y0 + filas[0] * escala_y
+    y1 = rectangulo.y0 + (filas[-1] + 1) * escala_y
+
+    # margen de seguridad para no cortar letras del borde
+    margen = min(rectangulo.width, rectangulo.height) * ajustes["margen_porcentaje"] / 100
+    contenido = pymupdf.Rect(x0 - margen, y0 - margen, x1 + margen, y1 + margen)
+
+    # nunca sale de la pagina
+    return contenido & rectangulo
+
+
+def crear_imagen(pagina, ruta_imagen, dpi, recorte):
+    # guarda la pagina como png, si hay ajustes de recorte quita los margenes en blanco
+    zona = None
+    if recorte is not None:
+        try:
+            zona = detectar_contenido(pagina, recorte)
+        except Exception:
+            # si la deteccion falla se envia la pagina completa
+            zona = None
+
+    if zona is None or zona.is_empty:
+        zona = pagina.rect
+
+    dpi_real = dpi_seguro(zona.width, zona.height, dpi)
+    pixmap = pagina.get_pixmap(dpi=dpi_real, clip=zona, alpha=False)
+    pixmap.save(str(ruta_imagen))
+
+    # datos de la imagen que se guardan en las metricas de la respuesta
+    area_pagina = pagina.rect.width * pagina.rect.height
+    porcentaje = 100.0
+    if area_pagina > 0:
+        porcentaje = round(100 * zona.width * zona.height / area_pagina, 1)
+
+    return {
+        "ancho_px": pixmap.width,
+        "alto_px": pixmap.height,
+        "dpi": dpi_real,
+        "recortada": zona != pagina.rect,
+        "porcentaje_area": porcentaje,
+        "bytes": ruta_imagen.stat().st_size,
+    }
+
+
+def nombres_unicos(archivos):
+    # nombre que llevan los archivos de cada pdf, si dos pdf se llaman igual se agrega una marca de su ruta
+    cantidad = Counter(nombre_seguro(ruta.stem).lower() for ruta in archivos)
+    nombres = {}
+
+    for ruta in archivos:
+        nombre = nombre_seguro(ruta.stem)
+        if cantidad[nombre.lower()] > 1:
+            marca = hashlib.sha256(str(ruta.resolve()).lower().encode()).hexdigest()[:8]
+            nombre = f"{nombre}_{marca}"
+        nombres[ruta] = nombre
+
+    return nombres
+
+
+def primer_valor(datos, *claves):
+    # devuelve el valor de la primera clave que exista, cada proveedor usa nombres distintos
+    for clave in claves:
+        if datos.get(clave) is not None:
+            return datos.get(clave)
+    return None
+
+
+def metricas_uso(respuesta, tokens_prompt=None):
+    # pasa el consumo de tokens de gemini, anthropic u openai a los mismos nombres
+    # tokens_prompt es el conteo del prompt sin imagen, lo usa anthropic para separar la imagen
+    uso = consumo_respuesta(respuesta)
+    if not isinstance(uso, dict):
+        return {"tokens_prompt": None, "tokens_imagen": None, "tokens_entrada": None, "tokens_salida": None,
+                "tokens_razonamiento": None, "tokens_total": None, "uso_proveedor": None}
+
+    entrada = primer_valor(uso, "promptTokenCount", "input_tokens", "prompt_tokens")
+
+    # gemini separa en su respuesta los tokens de texto y los de imagen
+    tokens_imagen = None
+    tokens_texto = None
+    for detalle in uso.get("promptTokensDetails") or []:
+        if detalle.get("modality") == "IMAGE":
+            tokens_imagen = detalle.get("tokenCount")
+        elif detalle.get("modality") == "TEXT":
+            tokens_texto = detalle.get("tokenCount")
+
+    # anthropic los manda sumados, la imagen es lo que queda al restar el prompt contado aparte
+    if tokens_imagen is None and tokens_prompt is not None and entrada is not None and entrada >= tokens_prompt:
+        tokens_texto = tokens_prompt
+        tokens_imagen = entrada - tokens_prompt
+
+    detalle_salida = uso.get("completion_tokens_details") or {}
+
+    salida = primer_valor(uso, "candidatesTokenCount", "output_tokens", "completion_tokens")
+    razonamiento = primer_valor(uso, "thoughtsTokenCount")
+    if razonamiento is None:
+        razonamiento = detalle_salida.get("reasoning_tokens")
+
+    # anthropic no manda el total, se suma
+    total = primer_valor(uso, "totalTokenCount", "total_tokens")
+    if total is None and entrada is not None and salida is not None:
+        total = entrada + salida
+
+    return {
+        "tokens_prompt": tokens_texto,
+        "tokens_imagen": tokens_imagen,
+        "tokens_entrada": entrada,
+        "tokens_salida": salida,
+        "tokens_razonamiento": razonamiento,
+        "tokens_total": total,
+        "uso_proveedor": uso,
+    }
+
+
+def escribir_json(ruta, contenido):
+    # escribe primero un temporal y despues lo reemplaza, asi quien lo lea nunca ve un archivo a medias
+    temporal = ruta.with_name(ruta.name + ".tmp")
+    texto = json.dumps(contenido, ensure_ascii=False, indent=2, default=str)
+    temporal.write_text(texto, encoding="utf-8")
+    os.replace(temporal, ruta)
+
+
 def agregar_linea(ruta, datos):
     # agrega una linea json al final del archivo
     with ruta.open("a", encoding="utf-8") as archivo:
@@ -551,6 +717,13 @@ class Proceso:
         # se activa cuando la ia rechaza la clave o el modelo, asi las demas paginas ya no se envian
         self.detener = threading.Event()
 
+        # ajustes del recorte de margenes, none si esta apagado
+        self.recorte = None
+
+        # carpeta de las imagenes listas para la ia y carpeta de sus respuestas, una por imagen
+        self.carpeta_imagenes = salida / "imagenes"
+        self.carpeta_respuestas = salida / "respuestas_ia"
+
     def anotar_error(self, datos):
         datos["fechaUTC"] = ahora_utc()
         agregar_linea(self.ruta_errores, datos)
@@ -559,11 +732,6 @@ class Proceso:
         # guarda una pagina, primero en archivos locales y despues en el repositorio
         datos = registro.como_json()
         datos["ProcesadoUTC"] = ahora_utc()
-
-        # json junto a la imagen
-        if ruta_imagen is not None:
-            texto = json.dumps(datos, ensure_ascii=False, indent=2, default=str)
-            ruta_imagen.with_suffix(".json").write_text(texto, encoding="utf-8")
 
         # historial, de aqui se arma el csv
         agregar_linea(self.ruta_resultados, datos)
@@ -614,12 +782,56 @@ class Proceso:
         self.resumen.excluidas = self.resumen.excluidas + 1
         self.informar(f"  Página {pagina}: EXCLUIDA, no se guardan datos ({motivo})")
 
-    def analizar(self, origen, pagina, ruta_imagen, auditoria):
+    def guardar_respuesta(self, origen, pagina, ruta_imagen, auditoria, info_imagen, datos, respuesta, segundos, error):
+        # deja la respuesta de la ia y sus metricas en un json por imagen, otro programa lo pasa a sql server
+        if error is not None:
+            estado = "error"
+        elif datos.get("DocumentoExcluido") is True or datos.get("DocumentoExcluido") == "true":
+            estado = "excluida"
+        else:
+            estado = "extraida"
+
+        # anthropic no separa prompt e imagen, el extractor cuenta el prompt una vez para restarlo
+        tokens_prompt = None
+        if respuesta is not None and hasattr(self.extractor, "contar_tokens_prompt"):
+            tokens_prompt = self.extractor.contar_tokens_prompt()
+
+        metricas = metricas_uso(respuesta, tokens_prompt)
+        metricas["segundos"] = round(segundos, 2)
+        metricas["imagen"] = info_imagen
+
+        mensaje_error = None
+        if error is not None:
+            mensaje_error = f"{type(error).__name__}: {error}"
+
+        contenido = {
+            "archivo_origen": origen[:500],
+            "archivo": os.path.basename(origen),
+            "pagina": pagina,
+            "imagen": ruta_imagen.name,
+            "huella_pdf": auditoria.get("_archivo_hash_sha256", ""),
+            "modelo": auditoria.get("_modelo", ""),
+            "fecha_utc": ahora_utc(),
+            "estado": estado,
+            "respuesta": datos,
+            "error": mensaje_error,
+            "metricas": metricas,
+        }
+
+        try:
+            escribir_json(self.carpeta_respuestas / ruta_imagen.with_suffix(".json").name, contenido)
+        except OSError as falla:
+            self.anotar_error({"ArchivoOrigen": origen, "NumPagina": pagina, "error": f"no se pudo escribir la respuesta: {falla}"})
+            self.informar(f"  Página {pagina}: no se pudo escribir el json de la respuesta: {falla}")
+
+    def analizar(self, origen, pagina, ruta_imagen, auditoria, info_imagen):
         # corre en un hilo aparte, envia la imagen a la ia
         # devuelve un registro, o un par motivo y consumo si la ia dijo que la pagina se excluye
 
         if self.detener.is_set():
             return None
+
+        inicio = time.monotonic()
 
         try:
             datos, respuesta = self.extractor.extraer(ruta_imagen)
@@ -628,10 +840,17 @@ class Proceso:
             if error.fatal:
                 self.detener.set()
                 raise
+            segundos = time.monotonic() - inicio
+            self.guardar_respuesta(origen, pagina, ruta_imagen, auditoria, info_imagen, None, error.respuesta, segundos, error)
             return crear_registro_error(origen, pagina, error, auditoria)
 
         except Exception as error:
+            segundos = time.monotonic() - inicio
+            self.guardar_respuesta(origen, pagina, ruta_imagen, auditoria, info_imagen, None, None, segundos, error)
             return crear_registro_error(origen, pagina, error, auditoria)
+
+        segundos = time.monotonic() - inicio
+        self.guardar_respuesta(origen, pagina, ruta_imagen, auditoria, info_imagen, datos, respuesta, segundos, None)
 
         try:
             excluida = datos.get("DocumentoExcluido")
@@ -647,7 +866,7 @@ class Proceso:
         except Exception as error:
             return crear_registro_error(origen, pagina, error, auditoria)
 
-    def procesar_pdf(self, ruta_pdf, indice, total_pdf, ejecutor, dpi, omitir_existentes):
+    def procesar_pdf(self, ruta_pdf, nombre_pdf, indice, total_pdf, ejecutor, dpi, omitir_existentes):
         # procesa todas las paginas de un pdf
         origen = str(ruta_pdf.resolve())
         self.informar(f"[{indice}/{total_pdf}] {ruta_pdf.name}")
@@ -664,11 +883,8 @@ class Proceso:
 
         auditoria = {"_archivo_hash_sha256": hash_archivo, "_modelo": self.extractor.nombre}
 
-        # carpeta de imagenes, el ultimo tramo sale de la ruta para que dos pdf con el mismo nombre no se pisen
-        hoy = date.today()
-        id_ruta = hashlib.sha256(origen.lower().encode()).hexdigest()[:8]
-        nombre_pdf = nombre_seguro(ruta_pdf.stem)
-        carpeta = self.salida / f"{nombre_pdf}_{hoy:%Y%m%d}_{id_ruta}"
+        # todas las imagenes de todos los pdf van a la misma carpeta
+        carpeta = self.carpeta_imagenes
 
         # paginas enviadas a la ia, cada una con su numero y su imagen
         pendientes = {}
@@ -699,10 +915,12 @@ class Proceso:
                     self.resumen.omitidas = self.resumen.omitidas + 1
                     continue
 
-                # filtro 2b, no esta en el indice pero ya esta guardada con esta ruta
-                # pasa por ejemplo si se borro el indice, o si el pdf cambio y sus paginas siguen en sql server
+                # filtro 2b, no esta terminada en el indice pero ya esta guardada con esta ruta
+                # pasa por ejemplo si se borro el indice, si se cargo con cargar_sql.py despues de un error,
+                # o si el pdf cambio y sus paginas siguen en sql server
                 # como solo se inserta, enviarla a la ia costaria dinero y no se podria guardar
-                if omitir_existentes and estado is None and self.repositorio.existe(origen, numero, hash_archivo):
+                sin_terminar = estado is None or estado == "error"
+                if omitir_existentes and sin_terminar and self.repositorio.existe(origen, numero, hash_archivo):
                     self.resumen.omitidas = self.resumen.omitidas + 1
                     self.informar(
                         f"  Página {numero}: ya está guardada con esta ruta, se omite. "
@@ -719,10 +937,10 @@ class Proceso:
                         self.excluir(origen, numero, hash_archivo, motivo, "análisis del PDF")
                         continue
 
-                    # crea la imagen png de la pagina
-                    ruta_imagen = carpeta / f"{nombre_pdf}_pagina_{numero:04d}_{hoy:%Y%m%d}.png"
-                    dpi_real = dpi_seguro(pagina.rect.width, pagina.rect.height, dpi)
-                    pagina.get_pixmap(dpi=dpi_real, alpha=False).save(str(ruta_imagen))
+                    # crea la imagen png de la pagina, el nombre es solo el del pdf y el numero de pagina
+                    ruta_imagen = carpeta / f"{nombre_pdf}_pagina_{numero}.png"
+                    # se recortan los margenes en blanco para enviar menos pixeles
+                    info_imagen = crear_imagen(pagina, ruta_imagen, dpi, self.recorte)
 
                 except Exception as error:
                     self.guardar(crear_registro_error(origen, numero, error, auditoria), None)
@@ -730,7 +948,7 @@ class Proceso:
 
                 # paso 4, se envia a la ia en un hilo aparte
                 self.resumen.analizadas = self.resumen.analizadas + 1
-                tarea = ejecutor.submit(self.analizar, origen, numero, ruta_imagen, auditoria)
+                tarea = ejecutor.submit(self.analizar, origen, numero, ruta_imagen, auditoria, info_imagen)
                 pendientes[tarea] = (numero, ruta_imagen)
 
         if len(pendientes) == 0:
@@ -759,7 +977,7 @@ class Proceso:
             if isinstance(resultado, tuple):
                 motivo = resultado[0]
                 consumo = resultado[1]
-                ruta_imagen.unlink(missing_ok=True)
+                # la imagen se conserva, en la carpeta quedan todas las paginas que se enviaron
                 self.excluir(origen, numero, hash_archivo, motivo, "IA", consumo)
                 continue
 
@@ -771,7 +989,7 @@ def procesar(
     salida,
     extractor,
     repositorio,
-    dpi=300,
+    dpi=200,
     omitir_existentes=True,
     concurrencia=4,
     informar=print,
@@ -779,6 +997,9 @@ def procesar(
     archivo_excluidos="excluidos.jsonl",
     archivo_errores="errores.jsonl",
     archivo_indice="indice.json",
+    recorte=None,
+    carpeta_imagenes="imagenes",
+    carpeta_respuestas="respuestas_ia",
 ):
     # punto de entrada del proceso, recorre todos los pdf de la carpeta
     salida.mkdir(parents=True, exist_ok=True)
@@ -794,6 +1015,12 @@ def procesar(
         archivo_indice,
     )
 
+    proceso.recorte = recorte
+    proceso.carpeta_imagenes = salida / carpeta_imagenes
+    proceso.carpeta_respuestas = salida / carpeta_respuestas
+    proceso.carpeta_imagenes.mkdir(parents=True, exist_ok=True)
+    proceso.carpeta_respuestas.mkdir(parents=True, exist_ok=True)
+
     archivos = buscar_pdfs(entrada)
     proceso.resumen.pdf = len(archivos)
 
@@ -801,11 +1028,13 @@ def procesar(
         informar(f"No se encontraron PDF en {entrada}")
         return proceso.resumen
 
+    nombres = nombres_unicos(archivos)
+
     # grupo de hilos, cada hilo espera la respuesta de una pagina
     with ThreadPoolExecutor(max_workers=concurrencia) as ejecutor:
         indice = 1
         for ruta_pdf in archivos:
-            proceso.procesar_pdf(ruta_pdf, indice, len(archivos), ejecutor, dpi, omitir_existentes)
+            proceso.procesar_pdf(ruta_pdf, nombres[ruta_pdf], indice, len(archivos), ejecutor, dpi, omitir_existentes)
             indice = indice + 1
 
     return proceso.resumen

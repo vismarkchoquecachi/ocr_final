@@ -104,6 +104,7 @@ def ejecutar(configuracion, entrada, salida, omitir, informar=print):
         reintentos=configuracion.reintentos,
         instrucciones=configuracion.instrucciones,
         solicitud=configuracion.solicitud,
+        esfuerzo=configuracion.esfuerzo,
     )
 
     # paso 4, elegir donde se revisa si una pagina ya esta guardada
@@ -142,6 +143,9 @@ def ejecutar(configuracion, entrada, salida, omitir, informar=print):
             archivo_excluidos=configuracion.archivo_excluidos,
             archivo_errores=configuracion.archivo_errores,
             archivo_indice=configuracion.archivo_indice,
+            recorte=configuracion.recorte,
+            carpeta_imagenes=configuracion.carpeta_imagenes,
+            carpeta_respuestas=configuracion.carpeta_respuestas,
         )
         return resumen
 
@@ -424,7 +428,7 @@ def principal():
 
     if env_nuevo:
         print(f"Se creó el archivo {config.BASE / '.env'}.")
-        print("Complete allí la clave de la IA (por ejemplo gemini_clave) y vuelva a ejecutar: python main.py")
+        print("Complete allí la clave de la IA (anthropic_clave) y vuelva a ejecutar: python main.py")
         return 1
 
     return modo_consola(argumentos.entrada, argumentos.salida, argumentos.destino, argumentos.csv)
