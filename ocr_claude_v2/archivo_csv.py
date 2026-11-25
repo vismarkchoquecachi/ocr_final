@@ -13,6 +13,7 @@ from pathlib import Path
 COLUMNAS_CSV = (
     "Archivo",
     "NumPagina",
+    "RutaImagen",
     "NombreOrdenante",
     "FechaTransferencia",
     "INVOICE",

@@ -43,6 +43,10 @@ def leer_respuesta(ruta):
     registro.JsonCrudo["metricas"] = contenido.get("metricas")
     registro.JsonCrudo["archivo_respuesta"] = ruta.name
 
+    # ruta completa de la imagen png que se envio a la ia
+    registro.RutaImagen = contenido.get("ruta_imagen")
+    registro.JsonCrudo["ruta_imagen"] = registro.RutaImagen
+
     return registro, None
 
 

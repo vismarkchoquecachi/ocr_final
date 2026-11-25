@@ -83,9 +83,12 @@ class Registro:
         Revisar=True,
         MotivoRevision=None,
         JsonCrudo=None,
+        RutaImagen=None,
     ):
         self.ArchivoOrigen = ArchivoOrigen
         self.NumPagina = NumPagina
+        # ruta completa de la imagen png de la pagina que se envio a la ia
+        self.RutaImagen = RutaImagen
         self.NombreOrdenante = NombreOrdenante
         self.FechaTransferencia = FechaTransferencia
         self.INVOICE = INVOICE
@@ -117,6 +120,7 @@ class Registro:
         return {
             "ArchivoOrigen": self.ArchivoOrigen,
             "NumPagina": self.NumPagina,
+            "RutaImagen": self.RutaImagen,
             "NombreOrdenante": self.NombreOrdenante,
             "FechaTransferencia": fecha,
             "INVOICE": self.INVOICE,
@@ -643,11 +647,17 @@ def motivo_exclusion_previa(pagina):
     return None
 
 
-def anotar_exclusion(ruta, origen, pagina, hash_archivo, motivo, detectado_por, consumo=None):
+def anotar_exclusion(ruta, origen, pagina, hash_archivo, motivo, detectado_por, consumo=None, ruta_imagen=None):
     # deja constancia de una pagina excluida con su motivo y los tokens que consumio
+    # si la pagina se envio a la ia se guarda tambien la ruta completa de su imagen
+    texto_ruta = None
+    if ruta_imagen is not None:
+        texto_ruta = str(ruta_imagen.resolve())
+
     agregar_linea(ruta, {
         "ArchivoOrigen": origen[:500],
         "NumPagina": pagina,
+        "RutaImagen": texto_ruta,
         "Hash": hash_archivo,
         "Motivo": motivo,
         "DetectadoPor": detectado_por,
@@ -741,6 +751,11 @@ class Proceso:
 
     def guardar(self, registro, ruta_imagen):
         # guarda una pagina, primero en archivos locales y despues en el repositorio
+        # la ruta completa de la imagen va al historial, al csv y al json que se guarda en sql server
+        if ruta_imagen is not None:
+            registro.RutaImagen = str(ruta_imagen.resolve())
+            registro.JsonCrudo["ruta_imagen"] = registro.RutaImagen
+
         datos = registro.como_json()
         datos["ProcesadoUTC"] = ahora_utc()
 
@@ -786,9 +801,9 @@ class Proceso:
             mensaje = mensaje + f" - {registro.MotivoRevision}"
         self.informar(mensaje)
 
-    def excluir(self, origen, pagina, hash_archivo, motivo, detectado_por, consumo=None):
+    def excluir(self, origen, pagina, hash_archivo, motivo, detectado_por, consumo=None, ruta_imagen=None):
         # anota una pagina excluida, no se guardan sus datos
-        anotar_exclusion(self.ruta_excluidos, origen, pagina, hash_archivo, motivo, detectado_por, consumo)
+        anotar_exclusion(self.ruta_excluidos, origen, pagina, hash_archivo, motivo, detectado_por, consumo, ruta_imagen)
         self.indice.marcar(hash_archivo, pagina, "excluida", origen)
         self.resumen.excluidas = self.resumen.excluidas + 1
         self.informar(f"  Página {pagina}: EXCLUIDA, no se guardan datos ({motivo})")
@@ -820,6 +835,7 @@ class Proceso:
             "archivo": os.path.basename(origen),
             "pagina": pagina,
             "imagen": ruta_imagen.name,
+            "ruta_imagen": str(ruta_imagen.resolve()),
             "huella_pdf": auditoria.get("_archivo_hash_sha256", ""),
             "modelo": auditoria.get("_modelo", ""),
             "fecha_utc": ahora_utc(),
@@ -998,7 +1014,7 @@ class Proceso:
                 motivo = resultado[0]
                 consumo = resultado[1]
                 # la imagen se conserva, en la carpeta quedan todas las paginas que se enviaron
-                self.excluir(origen, numero, hash_archivo, motivo, "IA", consumo)
+                self.excluir(origen, numero, hash_archivo, motivo, "IA", consumo, ruta_imagen)
                 continue
 
             self.guardar(resultado, ruta_imagen)
